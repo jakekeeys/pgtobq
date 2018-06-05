@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
+	"runtime"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -15,6 +17,7 @@ import (
 	"google.golang.org/api/option"
 )
 
+const Version = "1.0.0"
 const CREDENTIALS = "GOOGLE_APPLICATION_CREDENTIALS"
 
 var (
@@ -23,7 +26,9 @@ var (
 	pgTable    = flag.String("table", "", "postgres table name")
 	datasetId  = flag.String("dataset", "", "BigQuery dataset")
 	projectId  = flag.String("project", "", "BigQuery project id")
+	delimiter  = flag.String("delimiter", "|", "CSV delimiter, default |")
 	partitions = flag.Int("partitions", -1, "Number of per-day partitions, -1 to disable")
+	versionFlag = flag.Bool("version", false, "Print program version")
 )
 
 type Column struct {
@@ -38,19 +43,21 @@ func (c *Column) ToFieldSchema() *bigquery.FieldSchema {
 	f.Required = c.IsNullable == "NO"
 
 	switch c.Type {
-	case "character varying", "text":
+	case "varchar", "bpchar", "text", "citext", "xml", "cidr", "inet", "uuid", "bit", "varbit", "bytea", "money", "jsonb":
 		f.Type = bigquery.StringFieldType
-	case "integer", "bigint", "smallint":
+	case "int2", "int4", "int8":
 		f.Type = bigquery.IntegerFieldType
-	case "double precision":
+	case "float4", "float8", "numeric":
 		f.Type = bigquery.FloatFieldType
-	case "boolean":
+	case "bool":
 		f.Type = bigquery.BooleanFieldType
-	case "timestamp with time zone":
+	case "timestamptz":
 		f.Type = bigquery.TimestampFieldType
 	case "date":
 		f.Type = bigquery.DateFieldType
-	case "timestamp", "timestamp without time zone", "time without time zone":
+	case "timestamp":
+		f.Type = bigquery.DateTimeFieldType
+	case "time":
 		f.Type = bigquery.TimeFieldType
 	default:
 		// TODO: return as error
@@ -60,28 +67,32 @@ func (c *Column) ToFieldSchema() *bigquery.FieldSchema {
 	return &f
 }
 
-func schemaFromPostgres(db *sql.DB, schema, table string) bigquery.Schema {
-	rows, err := db.Query(`SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2 ORDER BY ordinal_position`, schema, table)
+
+func schemaFromPostgres(db *sql.DB, schema, table string) (bigquery.Schema, []string) {
+	rows, err := db.Query(`SELECT column_name, udt_name, is_nullable FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2 ORDER BY ordinal_position`, schema, table)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer rows.Close()
 	var c Column
 	var s bigquery.Schema
+	var cName []string
+
 	for rows.Next() {
 		if err := rows.Scan(&c.Name, &c.Type, &c.IsNullable); err != nil {
 			log.Fatal(err)
 		}
 		s = append(s, c.ToFieldSchema())
+		cName = append(cName, c.Name)
 	}
 	if err := rows.Err(); err != nil {
 		log.Fatal(err)
 	}
-	return s
+	return s, cName
 }
 
-func getRowsStream(db *sql.DB, schema, table string) io.Reader {
-	rows, err := db.Query(fmt.Sprintf(`SELECT row_to_json(t) FROM (SELECT * FROM "%s"."%s") AS t`, schema, table))
+func getRowsStream(db *sql.DB, schema, table, columns string) io.Reader {
+	rows, err := db.Query(fmt.Sprintf(`SELECT concat_ws('%s', %s) FROM "%s"."%s"`, *delimiter, columns, schema, table))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -107,6 +118,10 @@ func init() {
 }
 
 func main() {
+	if *versionFlag {
+		fmt.Fprintf(os.Stderr, "%s version: %s (%s on %s/%s; %s)\n", os.Args[0], Version, runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.Compiler)
+		os.Exit(0)
+	}
 	keyfile := os.Getenv(CREDENTIALS)
 	if keyfile == "" {
 		log.Fatal("!! missing ", CREDENTIALS)
@@ -126,7 +141,7 @@ func main() {
 
 	partitioned := *partitions > -1
 
-	schema := schemaFromPostgres(db, *pgSchema, *pgTable)
+	schema, columns := schemaFromPostgres(db, *pgSchema, *pgTable)
 	table := client.Dataset(*datasetId).Table(*pgTable)
 	if _, err := table.Metadata(ctx); err != nil {
 		metadata := &bigquery.TableMetadata{Schema: schema}
@@ -144,9 +159,11 @@ func main() {
 		table.TableID += time.Now().UTC().Format("$20060102")
 	}
 
-	f := getRowsStream(db, *pgSchema, *pgTable)
+	c := strings.Join(columns, ",")
+	f := getRowsStream(db, *pgSchema, *pgTable, c)
 	rs := bigquery.NewReaderSource(f)
-	rs.SourceFormat = bigquery.JSON
+	rs.SourceFormat = bigquery.CSV
+	rs.FieldDelimiter = *delimiter
 	rs.MaxBadRecords = 0
 	rs.Schema = schema
 	loader := table.LoaderFrom(rs)
@@ -154,6 +171,7 @@ func main() {
 	loader.WriteDisposition = bigquery.WriteTruncate
 	job, err := loader.Run(ctx)
 	if err != nil {
+		fmt.Println(db, *pgSchema, *pgTable)
 		log.Fatal(err)
 	}
 	for {
