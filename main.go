@@ -8,8 +8,8 @@ import (
 	"io"
 	"log"
 	"os"
-	"strings"
 	"runtime"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -21,13 +21,13 @@ const Version = "1.0.0"
 const CREDENTIALS = "GOOGLE_APPLICATION_CREDENTIALS"
 
 var (
-	pgConn     = flag.String("uri", "postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable", "postgres connection uri")
-	pgSchema   = flag.String("schema", "public", "postgres schema")
-	pgTable    = flag.String("table", "", "postgres table name")
-	datasetId  = flag.String("dataset", "", "BigQuery dataset")
-	projectId  = flag.String("project", "", "BigQuery project id")
-	delimiter  = flag.String("delimiter", "|", "CSV delimiter, default |")
-	partitions = flag.Int("partitions", -1, "Number of per-day partitions, -1 to disable")
+	pgConn      = flag.String("uri", "postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable", "postgres connection uri")
+	pgSchema    = flag.String("schema", "public", "postgres schema")
+	pgTable     = flag.String("table", "", "postgres table name")
+	datasetId   = flag.String("dataset", "", "BigQuery dataset")
+	projectId   = flag.String("project", "", "BigQuery project id")
+	delimiter   = flag.String("delimiter", "|", "CSV delimiter, default |")
+	partitions  = flag.Int("partitions", -1, "Number of per-day partitions, -1 to disable")
 	versionFlag = flag.Bool("version", false, "Print program version")
 )
 
@@ -41,6 +41,12 @@ func (c *Column) ToFieldSchema() *bigquery.FieldSchema {
 	var f bigquery.FieldSchema
 	f.Name = c.Name
 	f.Required = c.IsNullable == "NO"
+
+	switch c.Name {
+	// Allow BQ to convert special Epoch columns to timestamp
+	case "md_insert", "md_update":
+		c.Type = "timestamptz"
+	}
 
 	switch c.Type {
 	case "varchar", "bpchar", "text", "citext", "xml", "cidr", "inet", "uuid", "bit", "varbit", "bytea", "money", "jsonb":
@@ -66,7 +72,6 @@ func (c *Column) ToFieldSchema() *bigquery.FieldSchema {
 
 	return &f
 }
-
 
 func schemaFromPostgres(db *sql.DB, schema, table string) (bigquery.Schema, []string) {
 	rows, err := db.Query(`SELECT column_name, udt_name, is_nullable FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2 ORDER BY ordinal_position`, schema, table)
